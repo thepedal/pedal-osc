@@ -1,36 +1,40 @@
 using System;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 using Buzz.MachineInterface;   // IBuzzMachine, IBuzzMachineHost, MachineDecl, ParameterDecl,
-                               // Sample, WorkModes, MasterInfo
-using BuzzGUI.Interfaces;      // IBuzz, ISong (host object graph - for PlayPosition / Playing)
+                               // Sample, WorkModes
+using BuzzGUI.Interfaces;      // IMachine (for the instance name)
 
 namespace WDE.PedalOsc
 {
+    /// <summary>
+    /// Effect-class audio tap: passes audio through unchanged, measures level, and streams it
+    /// over OSC/UDP. Addresses are namespaced by the machine's own instance name, so several
+    /// taps can run on different busses without colliding.
+    ///
+    /// Song-global data (transport, tempo, beat/bar phase, machine parameters) is the job of
+    /// the companion control machine, Pedal OSC Data. The two are independent - neither needs
+    /// the other at runtime - and both send to the same endpoint, where the receiver merges
+    /// them by address.
+    /// </summary>
     [MachineDecl(Name = "Pedal OSC", ShortName = "PedalOSC", Author = "WDE",
                  InputCount = 1, OutputCount = 1)]
     public class PedalOscMachine : IBuzzMachine, IDisposable
     {
-        // ---- wire config (compile-time for now) ----
+        // ---- wire config (compile-time for now; matches Pedal OSC Data) ----
         const string AddrVersion   = "/rebuzz/v";
-        const string AddrRms       = "/rebuzz/rms";
-        const string AddrPeak      = "/rebuzz/peak";
-        const string AddrBeat      = "/rebuzz/beat";
-        const string AddrBar       = "/rebuzz/bar";
-        const string AddrBpm       = "/rebuzz/bpm";
-        const string AddrPlaying   = "/rebuzz/playing";
-        const string AddrBeatsBar  = "/rebuzz/beatsperbar";
-
-        const float  SchemaVersion = 1f;          // bump when the frame's meaning changes
-        const string DestHost      = "127.0.0.1"; // loopback; LAN is a later phase
+        const string TapPrefix     = "/rebuzz/tap/";
+        const float  SchemaVersion = 2f;
+        const string DestHost      = "127.0.0.1";
         const int    DestPort      = 9000;
-        const int    SendHz        = 125;         // sender rate (< the ~188 Hz Work rate)
+        const int    SendHz        = 125;
 
         // ReBuzz samples are +/-32768 float. Confirmed in the engine source: the master output
         // stage scales by audioOutMul = 1/32768.0f (WorkManager).
         const float  SampleScale   = 32768f;
 
-        // ---- parameters (ReBuzz requires at least one, or the machine fails to load) ----
+        // ---- parameters (>= 1 required or the machine fails to load; see Build 11.1) ----
 
         [ParameterDecl(Name = "Sensitivity", Description = "Scales level before sending (64 = x1.0).",
                        MinValue = 0, MaxValue = 127, DefValue = 64)]
@@ -40,40 +44,31 @@ namespace WDE.PedalOsc
                        MinValue = 0, MaxValue = 127, DefValue = 0)]
         public int Smooth { get; set; } = 0;
 
-        [ParameterDecl(Name = "Beats/Bar", Description = "Beats per bar, for the bar-phase output.",
-                       MinValue = 1, MaxValue = 16, DefValue = 4)]
-        public int BeatsPerBar { get; set; } = 4;
-
         // ------------------------------------------------------------------
-        // Feature frame. Published by the audio thread, consumed by the sender.
-        //
-        // A small ring of pre-allocated slots + a volatile "newest completed" index gives a
-        // lock-free, allocation-free SPSC handoff, and keeps all values of one audio block
-        // consistent with each other (a set of independent volatile floats could tear across
-        // blocks). The sender copies the struct in one go; with 4 slots and the writer only
-        // ~1.5x faster than the reader, a slot cannot be overwritten mid-copy in practice.
+        // Level frame. Published by the audio thread, consumed by the sender.
+        // 4-slot pre-allocated ring + volatile index: lock-free, allocation-free, and the
+        // whole frame stays internally consistent across the handoff.
         // ------------------------------------------------------------------
-        struct FeatureFrame
+        struct LevelFrame
         {
             public float Rms;
             public float Peak;
-            public float BeatPhase;   // 0..1 within the current beat
-            public float BarPhase;    // 0..1 within the current bar
-            public float Bpm;
-            public float Playing;     // 0 or 1
-            public float BeatsPerBar;
         }
 
-        const int SlotCount = 4;                  // power of two, for the & mask
-        readonly FeatureFrame[] _slots = new FeatureFrame[SlotCount];
+        const int SlotCount = 4;
+        readonly LevelFrame[] _slots = new LevelFrame[SlotCount];
         volatile int _newest = 0;
 
         float _smoothed;                          // audio-thread only (smoothing state)
 
         readonly IBuzzMachineHost host;
 
-        // Sender thread + socket. ALL network I/O lives here - never in Work().
-        Thread?    _sender;
+        // Cached addresses, rebuilt on the sender thread when the machine is renamed.
+        string _nameSeen = "";
+        string _addrRms = TapPrefix + "unnamed/rms";
+        string _addrPeak = TapPrefix + "unnamed/peak";
+
+        Thread? _sender;
         volatile bool _running;
         UdpClient? _udp;
 
@@ -90,53 +85,16 @@ namespace WDE.PedalOsc
         }
 
         // ------------------------------------------------------------------
-        // AUDIO THREAD. Pass audio through untouched, measure level, read transport,
-        // publish one feature frame. No allocation, no locks, no I/O.
+        // AUDIO THREAD. Pass audio through untouched, measure level, publish.
+        // No allocation, no locks, no I/O.
         // ------------------------------------------------------------------
         public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
         {
-            // --- transport / tempo -------------------------------------------------
-            // MasterInfo is only valid inside Work and parameter setters, and ReBuzz refreshes
-            // it before each Work batch (WorkManager.UpdateMasterAndSubTickInfoToHost).
-            float beatPhase = 0f, barPhase = 0f, bpm = 0f, playing = 0f;
-            int beatsPerBar = BeatsPerBar < 1 ? 1 : BeatsPerBar;
-
-            MasterInfo mi = host.MasterInfo;
-            if (mi != null && mi.TicksPerBeat > 0 && mi.SamplesPerTick > 0)
-            {
-                bpm = mi.BeatsPerMin;
-
-                // Absolute song position in ticks. Every getter on this path is a plain
-                // field read (MachineCore.Graph, SongCore.Buzz, ReBuzzCore.Song,
-                // SongCore.PlayPosition), so it is cheap and safe from the audio thread.
-                int tick = 0;
-                IBuzz? buzz = host.Machine?.Graph?.Buzz;
-                if (buzz != null)
-                {
-                    playing = buzz.Playing ? 1f : 0f;
-                    ISong? song = buzz.Song;
-                    if (song != null) tick = song.PlayPosition;
-                }
-
-                // MasterInfo gives position *within* a tick; PlayPosition gives which tick.
-                // Together they interpolate a continuous phase.
-                float posInTick = (float)mi.PosInTick / mi.SamplesPerTick;
-
-                int tpb = mi.TicksPerBeat;
-                int tickInBeat = ((tick % tpb) + tpb) % tpb;          // % is sign-preserving in C#
-                beatPhase = (tickInBeat + posInTick) / tpb;
-
-                int ticksPerBar = tpb * beatsPerBar;
-                int tickInBar = ((tick % ticksPerBar) + ticksPerBar) % ticksPerBar;
-                barPhase = (tickInBar + posInTick) / ticksPerBar;
-            }
-
-            // --- audio -------------------------------------------------------------
-            // input is null when nothing upstream is connected/active. Testing it directly
-            // lets nullable flow-analysis prove input is non-null in the loop below.
             float rms = 0f, peak = 0f;
             bool wroteSignal;
 
+            // input is null when nothing upstream is connected/active. Testing it directly
+            // lets nullable flow-analysis prove input is non-null in the loop below.
             if (input == null || n <= 0)
             {
                 if (output != null)
@@ -174,15 +132,9 @@ namespace WDE.PedalOsc
             float coef = 1f - (Smooth / 127f) * 0.98f;
             _smoothed += coef * (rms - _smoothed);
 
-            // --- publish -----------------------------------------------------------
             int next = (_newest + 1) & (SlotCount - 1);
-            _slots[next].Rms         = _smoothed;
-            _slots[next].Peak        = peak;
-            _slots[next].BeatPhase   = beatPhase;
-            _slots[next].BarPhase    = barPhase;
-            _slots[next].Bpm         = bpm;
-            _slots[next].Playing     = playing;
-            _slots[next].BeatsPerBar = beatsPerBar;
+            _slots[next].Rms  = _smoothed;
+            _slots[next].Peak = peak;
             _newest = next;                       // volatile write publishes the slot
 
             return wroteSignal;
@@ -194,23 +146,20 @@ namespace WDE.PedalOsc
         void SenderLoop()
         {
             int periodMs = Math.Max(1, 1000 / SendHz);
-            var msgs = new (string, float)[8];    // reused; sender thread only
+            var msgs = new (string, float)[3];    // reused; sender thread only
 
             while (_running)
             {
                 UdpClient? udp = _udp;            // snapshot (may be nulled by Dispose)
                 if (udp == null) break;
 
-                FeatureFrame f = _slots[_newest]; // volatile read, then one struct copy
+                RefreshAddresses();
 
-                msgs[0] = (AddrVersion,  SchemaVersion);
-                msgs[1] = (AddrRms,      f.Rms);
-                msgs[2] = (AddrPeak,     f.Peak);
-                msgs[3] = (AddrBeat,     f.BeatPhase);
-                msgs[4] = (AddrBar,      f.BarPhase);
-                msgs[5] = (AddrBpm,      f.Bpm);
-                msgs[6] = (AddrPlaying,  f.Playing);
-                msgs[7] = (AddrBeatsBar, f.BeatsPerBar);
+                LevelFrame f = _slots[_newest];   // volatile read, then one struct copy
+
+                msgs[0] = (AddrVersion, SchemaVersion);
+                msgs[1] = (_addrRms,    f.Rms);
+                msgs[2] = (_addrPeak,   f.Peak);
 
                 try
                 {
@@ -223,11 +172,49 @@ namespace WDE.PedalOsc
             }
         }
 
+        /// <summary>
+        /// Namespace this instance's addresses by the machine's own name, so two taps on
+        /// different busses do not clobber each other. IMachine.Name is a plain field read
+        /// (MachineCore.Name => name), so checking it per send is cheap; the sanitise and
+        /// string concat only run when the name actually changes.
+        /// </summary>
+        void RefreshAddresses()
+        {
+            try
+            {
+                IMachine? m = host.Machine;
+                string current = m?.Name ?? "";
+                if (current == _nameSeen) return;
+
+                _nameSeen = current;
+                string safe = Sanitise(current);
+                _addrRms  = TapPrefix + safe + "/rms";
+                _addrPeak = TapPrefix + safe + "/peak";
+            }
+            catch { /* keep the previous addresses */ }
+        }
+
+        /// <summary>
+        /// Make a string safe for an OSC address element. OSC reserves space and
+        /// # * , / ? [ ] { } - everything outside [a-z0-9_] is folded to '_'.
+        /// </summary>
+        static string Sanitise(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "unnamed";
+            var sb = new StringBuilder(s.Length);
+            foreach (char c in s)
+            {
+                if (c >= 'a' && c <= 'z') sb.Append(c);
+                else if (c >= 'A' && c <= 'Z') sb.Append((char)(c + 32));
+                else if (c >= '0' && c <= '9') sb.Append(c);
+                else sb.Append('_');
+            }
+            return sb.Length == 0 ? "unnamed" : sb.ToString();
+        }
+
         // ------------------------------------------------------------------
-        // Teardown. Confirmed against the engine source: deleting a machine runs
-        // MachineManager.DeleteMachine -> ManagedMachineHost.Release(), which calls
-        // Dispose() on machines implementing IDisposable. So this reliably stops the
-        // sender on removal; IsBackground covers process exit as a backstop.
+        // Teardown. Confirmed in the engine source: MachineManager.DeleteMachine ->
+        // ManagedMachineHost.Release() calls Dispose() on IDisposable machines.
         // ------------------------------------------------------------------
         public void Dispose()
         {

@@ -27,8 +27,8 @@
     <AssemblyTitle>Pedal OSC</AssemblyTitle>
     <Company>WDE</Company>
     <Product>Pedal OSC</Product>
-    <Description>Audio level, beat and bar phase -> OSC bridge for ReBuzz (audio-reactive video)</Description>
-    <Version>1.1.0</Version>
+    <Description>Per-instance audio level -> OSC tap for ReBuzz (audio-reactive video)</Description>
+    <Version>2.0.0</Version>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="ReBuzz">

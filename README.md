@@ -11,22 +11,33 @@ over OSC and drive shader uniforms in a separate OpenGL renderer.
 ## What it does
 
 - Passes audio through unchanged (insert it anywhere; conventionally just before
-  **Master** to tap the full mix).
-- Measures per-block RMS, applies **Sensitivity** and **Smooth**, and sends the
-  result as a single OSC float.
+  **Master** to tap the full mix, or on a bus to tap that bus).
+- Measures per-block RMS and peak, applies **Sensitivity** and **Smooth**, and
+  sends them under this instance's own name.
 - All network I/O runs on a background sender thread — **never** on the audio
   thread.
 
 ## OSC output
 
-| Field     | Value                                   |
-|-----------|-----------------------------------------|
-| Address   | `/rebuzz/rms`                           |
-| Argument  | one big-endian `float32`, ~0..1         |
-| Transport | UDP to `127.0.0.1:9000`                 |
-| Rate      | ~125 messages/sec                       |
+Schema **v2**, one OSC bundle per send (~125/sec) to `127.0.0.1:9000`:
 
-Host, port, and address are currently compile-time constants in `PedalOsc.cs`.
+| Address | Value |
+|---|---|
+| `/rebuzz/v` | schema version (`2`) |
+| `/rebuzz/tap/<name>/rms` | smoothed level, 0..1 |
+| `/rebuzz/tap/<name>/peak` | block peak, 0..1 |
+
+`<name>` is this instance's own machine name, lowercased and folded to
+`[a-z0-9_]`, so several taps on different busses never collide. Rename the
+machine in ReBuzz and the addresses follow.
+
+Host and port are compile-time constants in `PedalOsc.cs`.
+
+**Transport, tempo, beat phase and machine parameters come from the companion
+control machine,** [pedal-osc-data](https://github.com/thepedal/pedal-osc-data),
+under `/rebuzz/song/...` and `/rebuzz/param/...`. The two machines are
+independent — neither needs the other at runtime — and both send to the same
+endpoint.
 
 ## Parameters
 
@@ -48,9 +59,8 @@ ReBuzz to pick up a newly added machine.
 
 ## Status
 
-Phase-1 spike — single-scalar output. Roadmap: a fuller feature frame (FFT
-bands, BPM, beat phase, MIDI events) and OSC over LAN to a separate render
-machine.
+Working. Roadmap: FFT band energies, MIDI note events, and OSC over LAN to a
+separate render machine.
 
 ## Licence
 
