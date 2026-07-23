@@ -27,8 +27,8 @@
     <AssemblyTitle>Pedal OSC</AssemblyTitle>
     <Company>WDE</Company>
     <Product>Pedal OSC</Product>
-    <Description>Master RMS -> OSC bridge for ReBuzz (audio-reactive video spike)</Description>
-    <Version>1.0.0</Version>
+    <Description>Audio level, beat and bar phase -> OSC bridge for ReBuzz (audio-reactive video)</Description>
+    <Version>1.1.0</Version>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="ReBuzz">
