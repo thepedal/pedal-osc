@@ -45,6 +45,18 @@ namespace WDE.PedalOsc
         readonly int[] _binLo = new int[MaxBands];
         readonly int[] _binHi = new int[MaxBands];
 
+        // Previous frame's per-bin magnitude, for spectral-flux onset detection.
+        readonly float[] _prevMag = new float[FftSize / 2];
+        bool _havePrev;
+
+        /// <summary>
+        /// Spectral flux of the last Analyse() call: sum of positive bin-to-bin magnitude
+        /// increases between this frame and the previous one. Rises sharply at note/drum
+        /// onsets (energy appearing) and stays near zero on sustained material. Raw magnitude
+        /// units; the machine applies an adaptive threshold. Zero on the first frame.
+        /// </summary>
+        public float LastFlux { get; private set; }
+
         int _sampleRate = -1;
         int _bandCount = -1;
 
@@ -118,6 +130,25 @@ namespace WDE.PedalOsc
             }
 
             Transform();
+
+            // Per-bin magnitude, computed once and reused for band energy and spectral flux.
+            // Band energy uses mag^2 (== re^2 + im^2), so band values are bit-identical to the
+            // previous direct-energy summation; flux needs the linear magnitude.
+            int half = FftSize / 2;
+            float flux = 0f;
+            for (int k = 1; k < half; k++)      // skip DC
+            {
+                float re = _re[k], im = _im[k];
+                float mag = (float)Math.Sqrt((double)re * re + (double)im * im);
+                if (_havePrev)
+                {
+                    float d = mag - _prevMag[k];
+                    if (d > 0f) flux += d;       // onsets are energy RISING; ignore decreases
+                }
+                _prevMag[k] = mag;
+            }
+            LastFlux = _havePrev ? flux / Norm : 0f;
+            _havePrev = true;
 
             for (int b = 0; b < _bandCount; b++)
             {

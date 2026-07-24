@@ -46,7 +46,7 @@ discovered from the stream, so nothing is named on the command line.
 | `WARP` | radial ripple distortion |
 | `FLASH` | disc brightness pulse |
 
-On startup it auto-routes something sensible — audio level to brightness and
+On startup it auto-routes something sensible (FLASH prefers an onset envelope if the effect is publishing one, else beat phase) — audio level to brightness and
 size, beat to flash, bar to ring, and the first two exported parameters to hue
 and warp — then prints the routing. Re-route anything from there:
 

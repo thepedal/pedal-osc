@@ -67,6 +67,10 @@ namespace WDE.PedalOsc
                        MinValue = 0, MaxValue = BandAnalyser.MaxBands, DefValue = BandAnalyser.MaxBands)]
         public int Bands { get; set; } = BandAnalyser.MaxBands;
 
+        [ParameterDecl(Name = "Onset", Description = "Transient/onset sensitivity (0 = off; higher = more sensitive).",
+                       MinValue = 0, MaxValue = 127, DefValue = 64)]
+        public int Onset { get; set; } = 64;
+
         // ---- destination (parameter-driven; persists with the song) ----
         // IP as four octets; all-zero = loopback. Port as an offset from 9000. See OscConfig.cs.
 
@@ -132,6 +136,7 @@ namespace WDE.PedalOsc
         string _addrRms = TapPrefix + "unnamed/rms";
         string _addrPeak = TapPrefix + "unnamed/peak";
         readonly string[] _addrBands = new string[BandAnalyser.MaxBands];
+        string _addrOnset = TapPrefix + "unnamed/onset";
 
         Thread? _sender;
         volatile bool _running;
@@ -143,6 +148,7 @@ namespace WDE.PedalOsc
 
             for (int b = 0; b < BandAnalyser.MaxBands; b++)
                 _addrBands[b] = TapPrefix + "unnamed/band" + b;
+            _addrOnset = TapPrefix + "unnamed/onset";
 
             _running = true;
             _sender = new Thread(SenderLoop) { IsBackground = true, Name = "PedalOscSender" };
@@ -231,6 +237,16 @@ namespace WDE.PedalOsc
             var bands = new float[BandAnalyser.MaxBands];
             var bandsSmoothed = new float[BandAnalyser.MaxBands];
 
+            // Onset detection state. A rolling window of recent flux gives an adaptive
+            // threshold (mean + K*stddev); a detected onset sets an envelope to 1.0 which then
+            // decays each send, so the wire carries a continuous 0..1 that spikes on transients
+            // and eases back - fitting last-writer-wins and driving a decaying visual flash.
+            const int FluxWin = 43;                // ~0.35 s of history at the send rate
+            var fluxHist = new float[FluxWin];
+            int fluxCount = 0, fluxPos = 0;
+            float prevFlux = 0f, onsetEnv = 0f;
+            int sinceOnset = 999;
+
             while (_running)
             {
                 // Re-point the socket from the destination parameters. Cheap unless it changed.
@@ -247,8 +263,9 @@ namespace WDE.PedalOsc
                 msgs.Add((_addrPeak,   f.Peak));
 
                 int wantBands = Bands;
+                int wantOnset = Onset;
                 int sr = _sampleRate;
-                if (wantBands > 0 && sr > 0)
+                if ((wantBands > 0 || wantOnset > 0) && sr > 0)
                 {
                     // Copy the newest FftSize samples out of the ring, oldest first. The mask
                     // handles wrap; C# bitwise AND on a negative index is correct two's
@@ -269,6 +286,44 @@ namespace WDE.PedalOsc
                         if (v > 1f) v = 1f;
                         bandsSmoothed[b] += coef * (v - bandsSmoothed[b]);
                         msgs.Add((_addrBands[b], bandsSmoothed[b]));
+                    }
+
+                    if (wantOnset > 0)
+                    {
+                        float flux = analyser.LastFlux;
+
+                        // Adaptive threshold from the rolling window. K falls from ~4.0 (Onset
+                        // low, insensitive) to ~1.5 (Onset high, sensitive), so a bigger
+                        // parameter fires more readily.
+                        float mean = 0f;
+                        for (int i = 0; i < fluxCount; i++) mean += fluxHist[i];
+                        mean = fluxCount > 0 ? mean / fluxCount : 0f;
+                        float var = 0f;
+                        for (int i = 0; i < fluxCount; i++)
+                        {
+                            float d = fluxHist[i] - mean; var += d * d;
+                        }
+                        float std = fluxCount > 1 ? (float)Math.Sqrt(var / fluxCount) : 0f;
+                        float k = 4.0f - (wantOnset / 127f) * 2.5f;
+                        float thresh = mean + k * std + 1e-4f;
+
+                        // Fire on a rising value above threshold, outside the refractory window.
+                        sinceOnset++;
+                        if (flux > thresh && flux > prevFlux && sinceOnset > 6)
+                        {
+                            onsetEnv = 1f;
+                            sinceOnset = 0;
+                        }
+                        prevFlux = flux;
+
+                        // Push flux into the history AFTER thresholding, so the window is the
+                        // baseline the current frame is judged against.
+                        fluxHist[fluxPos] = flux;
+                        fluxPos = (fluxPos + 1) % FluxWin;
+                        if (fluxCount < FluxWin) fluxCount++;
+
+                        msgs.Add((_addrOnset, onsetEnv));
+                        onsetEnv *= 0.80f;         // decay ~5-6 sends to near zero
                     }
                 }
 
@@ -299,6 +354,7 @@ namespace WDE.PedalOsc
                 _addrPeak = TapPrefix + safe + "/peak";
                 for (int b = 0; b < BandAnalyser.MaxBands; b++)
                     _addrBands[b] = TapPrefix + safe + "/band" + b;
+                _addrOnset = TapPrefix + safe + "/onset";
             }
             catch { /* keep the previous addresses */ }
         }

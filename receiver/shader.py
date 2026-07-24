@@ -77,13 +77,18 @@ SLOTS = ["BRIGHT", "SIZE", "HUE", "RING", "WARP", "FLASH"]
 
 # Sensible opening routing, applied as sources appear. Each entry is a
 # predicate over the address; the first unrouted match wins.
+# Each target lists predicates in PREFERENCE order; the first one that matches an
+# available source wins. FLASH prefers an onset envelope (punchy, transient-driven)
+# but falls back to beat phase when no onset stream is present, so the default
+# visual always has a pulse.
 DEFAULTS = {
-    "BRIGHT": lambda a: a.startswith(TAP) and a.endswith("/rms"),
-    "SIZE":   lambda a: a.startswith(TAP) and a.endswith("/rms"),
-    "FLASH":  lambda a: a == SONG + "beat",
-    "RING":   lambda a: a == SONG + "bar",
-    "HUE":    lambda a: a.startswith(PARAM),
-    "WARP":   lambda a: a.startswith(PARAM),
+    "BRIGHT": [lambda a: a.startswith(TAP) and a.endswith("/rms")],
+    "SIZE":   [lambda a: a.startswith(TAP) and a.endswith("/rms")],
+    "FLASH":  [lambda a: a.startswith(TAP) and a.endswith("/onset"),
+               lambda a: a == SONG + "beat"],
+    "RING":   [lambda a: a == SONG + "bar"],
+    "HUE":    [lambda a: a.startswith(PARAM)],
+    "WARP":   [lambda a: a.startswith(PARAM)],
 }
 
 # Tap levels are small (a loud mix reads ~0.25); everything else is already 0..1.
@@ -269,17 +274,23 @@ def main():
         for slot in SLOTS:
             if route[slot]["src"] is not None:
                 continue
-            pred = DEFAULTS.get(slot)
-            if pred is None:
+            preds = DEFAULTS.get(slot)
+            if not preds:
                 continue
             taken = {route[s]["src"] for s in SLOTS if route[s]["src"]}
-            for a in sources:
-                # Allow BRIGHT and SIZE to share one tap; otherwise prefer unused.
-                if pred(a) and (a not in taken or slot in ("SIZE",)):
-                    route[slot]["src"] = a
-                    route[slot]["gain"] = default_gain(a)
-                    print(f"  {slot:6s} <- {short(a)}")
+            chosen = None
+            for pred in preds:                 # preference order
+                for a in sources:
+                    # Allow BRIGHT and SIZE to share one tap; otherwise prefer unused.
+                    if pred(a) and (a not in taken or slot in ("SIZE",)):
+                        chosen = a
+                        break
+                if chosen:
                     break
+            if chosen:
+                route[slot]["src"] = chosen
+                route[slot]["gain"] = default_gain(chosen)
+                print(f"  {slot:6s} <- {short(chosen)}")
 
     def render():
         now = time.time()

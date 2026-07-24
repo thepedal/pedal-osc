@@ -28,7 +28,7 @@
     <Company>WDE</Company>
     <Product>Pedal OSC</Product>
     <Description>Per-instance audio level and FFT bands -> OSC tap for ReBuzz (audio-reactive video)</Description>
-    <Version>2.3.0</Version>
+    <Version>2.4.0</Version>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="ReBuzz">
