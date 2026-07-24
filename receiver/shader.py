@@ -118,6 +118,7 @@ uniform float uBeatsPerBar;
 uniform float uAspect;
 uniform float uTime;
 uniform float uStale;
+uniform float uHaveSong;    // 1.0 when transport data is arriving
 uniform int   uSelected;     // highlighted HUD row
 uniform int   uActive;       // bitmask of routed slots
 
@@ -148,13 +149,16 @@ void main() {
     float ring = smoothstep(0.013, 0.0, abs(rw - ringR)) * (1.0 - uRing) * 0.65;
     col += ring * vec3(0.35, 0.65, 1.00);
 
-    // Beat ticks across the top, straight off the bar phase.
+    // Beat ticks across the top, straight off the bar phase. Dimmed when no
+    // transport data is arriving, so a frozen grid reads as "no data" not "beat 1".
     if (uv.y > 0.955) {
         float n = max(1.0, uBeatsPerBar);
         float slot = floor(uv.x * n);
         float cur = floor(uBar * n);
         if (abs(fract(uv.x * n) - 0.5) < 0.30) {
-            col = (slot == cur) ? base * (0.35 + 0.65 * uFlash) : vec3(0.10);
+            vec3 lit = base * (0.35 + 0.65 * uFlash);
+            col = (slot == cur) ? lit : vec3(0.10);
+            if (uHaveSong < 0.5) col *= 0.25;
         }
     }
 
@@ -258,7 +262,7 @@ def main():
 
     # Routing state: one entry per visual target.
     route = {s: {"src": None, "gain": 1.0, "shown": 0.0} for s in SLOTS}
-    st = {"sel": 0, "smooth": True, "t0": time.time(), "seen": 0}
+    st = {"sel": 0, "smooth": True, "t0": time.time(), "seen": 0, "song_warned": False}
 
     def autoroute(sources):
         """Fill unrouted targets as sources appear, without disturbing manual choices."""
@@ -290,6 +294,15 @@ def main():
             st["seen"] = len(sources)
             autoroute(sources)
 
+        # If nothing on /rebuzz/song has arrived a few seconds in, the beat grid is
+        # frozen at bar 0 and looks broken. Say so once, rather than silently.
+        have_song = any(k.startswith(SONG) for k in vals)
+        if (not have_song and not st["song_warned"]
+                and (now - st["t0"]) > 4.0 and vals):
+            print("note: no /rebuzz/song data - is Pedal OSC Data in the song? "
+                  "beat visuals will stay frozen without it.")
+            st["song_warned"] = True
+
         stale = (last_rx == 0.0) or (now - last_rx > 1.0)
 
         active = 0
@@ -320,6 +333,7 @@ def main():
         prog["uAspect"].value = window.width / max(1, window.height)
         prog["uTime"].value = now - st["t0"]
         prog["uStale"].value = 1.0 if stale else 0.0
+        prog["uHaveSong"].value = 1.0 if have_song else 0.0
         prog["uSelected"].value = st["sel"]
         prog["uActive"].value = active
         vao.render(moderngl.TRIANGLE_STRIP)

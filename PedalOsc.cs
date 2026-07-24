@@ -1,3 +1,18 @@
+// PedalOsc.cs — part of Pedal OSC
+// Copyright (C) 2026 thepedal
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+// PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program. If not, see <https://www.gnu.org/licenses/>.
+
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -34,9 +49,15 @@ namespace WDE.PedalOsc
 
         // ---- parameters (>= 1 required or the machine fails to load; see Build 11.1) ----
 
-        [ParameterDecl(Name = "Sensitivity", Description = "Scales level before sending (64 = x1.0).",
+        [ParameterDecl(Name = "Sensitivity", Description = "Scales level before sending (64 = x1.0, 127 = x8).",
                        MinValue = 0, MaxValue = 127, DefValue = 64)]
         public int Sensitivity { get; set; } = 64;
+
+        // Exponential gain: 2^((Sensitivity-64)/21). 64 -> x1.0 (so existing patches are
+        // unchanged), 127 -> x8, 0 -> x0.12. Replaces the old linear Sensitivity/64 (max x1.98),
+        // which could not reach full scale from a typical ~0.26 RMS peak for consumers with no
+        // gain of their own.
+        float Gain => (float)Math.Pow(2.0, (Sensitivity - 64) / 21.0);
 
         [ParameterDecl(Name = "Smooth", Description = "One-pole smoothing on the sent level (0 = none).",
                        MinValue = 0, MaxValue = 127, DefValue = 0)]
@@ -174,7 +195,7 @@ namespace WDE.PedalOsc
                     _ring[(w + i) & (RingSize - 1)] = (input[i].L + input[i].R) * 0.5f;
                 _ringWrite = (w + n) & (RingSize - 1);
 
-                float gain = Sensitivity / 64f;   // 64 = x1.0
+                float gain = Gain;
                 rms  = (float)Math.Sqrt(sumSq / (2.0 * n)) / SampleScale * gain;
                 peak = peak / SampleScale * gain;
 
@@ -239,7 +260,7 @@ namespace WDE.PedalOsc
                     analyser.Configure(sr, wantBands);
                     analyser.Analyse(frame, SampleScale, bands);
 
-                    float gain = Sensitivity / 64f;
+                    float gain = Gain;
                     float coef = 1f - (Smooth / 127f) * 0.98f;
 
                     for (int b = 0; b < wantBands; b++)

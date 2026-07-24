@@ -21,6 +21,8 @@ import time
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import ThreadingOSCUDPServer
 
+STALE_EXPIRY_S = 10.0   # drop an address this long after its last packet
+
 _vals = {}          # address -> (value, last_seen)
 _count = 0
 _last_rx = 0.0
@@ -56,6 +58,11 @@ def display_loop():
         time.sleep(1 / 10)
         now = time.time()
         with _lock:
+            # Expire addresses unseen for a while, so ghost entries from a previous
+            # export selection do not linger forever after you re-point the machine.
+            cutoff = now - STALE_EXPIRY_S
+            for addr in [a for a, (_, seen) in _vals.items() if seen < cutoff]:
+                del _vals[addr]
             snapshot = dict(_vals)
             count = _count
             last_rx = _last_rx

@@ -51,7 +51,8 @@ endpoint.
 
 ## Parameters
 
-- **Sensitivity** (0–127, default 64 = ×1.0) — scales levels before sending.
+- **Sensitivity** (0–127, default 64 = ×1.0, 127 = ×8) — scales levels before
+  sending, on an exponential curve so 64 is unity and the top reaches ×8.
 - **Smooth** (0–127, default 0 = raw) — one-pole smoothing on sent values.
 - **Bands** (0–8, default 8) — how many FFT bands to publish. `0` disables the
   transform entirely.
