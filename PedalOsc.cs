@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -44,6 +45,10 @@ namespace WDE.PedalOsc
                        MinValue = 0, MaxValue = 127, DefValue = 0)]
         public int Smooth { get; set; } = 0;
 
+        [ParameterDecl(Name = "Bands", Description = "Log-spaced FFT bands to publish (0 = off).",
+                       MinValue = 0, MaxValue = BandAnalyser.MaxBands, DefValue = BandAnalyser.MaxBands)]
+        public int Bands { get; set; } = BandAnalyser.MaxBands;
+
         // ------------------------------------------------------------------
         // Level frame. Published by the audio thread, consumed by the sender.
         // 4-slot pre-allocated ring + volatile index: lock-free, allocation-free, and the
@@ -61,12 +66,31 @@ namespace WDE.PedalOsc
 
         float _smoothed;                          // audio-thread only (smoothing state)
 
+        // ------------------------------------------------------------------
+        // Sample ring for spectral analysis.
+        //
+        // The FFT does NOT run on the audio thread. Work() only writes mono samples into this
+        // circular buffer (a couple of adds per sample); the sender thread copies the newest
+        // frame out and transforms it at its own rate. So band analysis costs the audio thread
+        // essentially nothing, however many bands are published - the same principle that
+        // keeps the control machine's parameter export off-thread.
+        //
+        // Sizing: the writer advances 48000 samples/sec, the reader takes FftSize every ~8 ms
+        // (~384 samples of write in that window) and copies in microseconds. 8192 gives an
+        // order of magnitude of headroom against the reader being lapped mid-copy.
+        // ------------------------------------------------------------------
+        const int RingSize = 8192;                // power of two, for the & mask
+        readonly float[] _ring = new float[RingSize];
+        volatile int _ringWrite = 0;
+        volatile int _sampleRate = 0;             // captured in Work(); MasterInfo is only valid there
+
         readonly IBuzzMachineHost host;
 
         // Cached addresses, rebuilt on the sender thread when the machine is renamed.
         string _nameSeen = "";
         string _addrRms = TapPrefix + "unnamed/rms";
         string _addrPeak = TapPrefix + "unnamed/peak";
+        readonly string[] _addrBands = new string[BandAnalyser.MaxBands];
 
         Thread? _sender;
         volatile bool _running;
@@ -75,6 +99,9 @@ namespace WDE.PedalOsc
         public PedalOscMachine(IBuzzMachineHost host)
         {
             this.host = host;
+
+            for (int b = 0; b < BandAnalyser.MaxBands; b++)
+                _addrBands[b] = TapPrefix + "unnamed/band" + b;
 
             _udp = new UdpClient();
             _udp.Connect(DestHost, DestPort);     // resolve the endpoint once, reuse per send
@@ -90,6 +117,11 @@ namespace WDE.PedalOsc
         // ------------------------------------------------------------------
         public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
         {
+            // MasterInfo is only valid inside Work and parameter setters. The sender thread
+            // needs the sample rate to place band edges, so capture it here.
+            MasterInfo mi = host.MasterInfo;
+            if (mi != null && mi.SamplesPerSec > 0) _sampleRate = mi.SamplesPerSec;
+
             float rms = 0f, peak = 0f;
             bool wroteSignal;
 
@@ -117,6 +149,13 @@ namespace WDE.PedalOsc
                     float al = l < 0f ? -l : l; if (al > peak) peak = al;
                     float ar = r < 0f ? -r : r; if (ar > peak) peak = ar;
                 }
+
+                // Feed the analysis ring with a mono sum. Kept separate from the level maths
+                // above so the FFT sees the raw signal, not the Sensitivity-scaled value.
+                int w = _ringWrite;
+                for (int i = 0; i < n; i++)
+                    _ring[(w + i) & (RingSize - 1)] = (input[i].L + input[i].R) * 0.5f;
+                _ringWrite = (w + n) & (RingSize - 1);
 
                 float gain = Sensitivity / 64f;   // 64 = x1.0
                 rms  = (float)Math.Sqrt(sumSq / (2.0 * n)) / SampleScale * gain;
@@ -146,7 +185,13 @@ namespace WDE.PedalOsc
         void SenderLoop()
         {
             int periodMs = Math.Max(1, 1000 / SendHz);
-            var msgs = new (string, float)[3];    // reused; sender thread only
+            var msgs = new List<(string, float)>(3 + BandAnalyser.MaxBands);
+
+            // Sender-thread only: analysis scratch and per-band smoothing state.
+            var analyser = new BandAnalyser();
+            var frame = new float[BandAnalyser.FftSize];
+            var bands = new float[BandAnalyser.MaxBands];
+            var bandsSmoothed = new float[BandAnalyser.MaxBands];
 
             while (_running)
             {
@@ -157,13 +202,40 @@ namespace WDE.PedalOsc
 
                 LevelFrame f = _slots[_newest];   // volatile read, then one struct copy
 
-                msgs[0] = (AddrVersion, SchemaVersion);
-                msgs[1] = (_addrRms,    f.Rms);
-                msgs[2] = (_addrPeak,   f.Peak);
+                msgs.Clear();
+                msgs.Add((AddrVersion, SchemaVersion));
+                msgs.Add((_addrRms,    f.Rms));
+                msgs.Add((_addrPeak,   f.Peak));
+
+                int wantBands = Bands;
+                int sr = _sampleRate;
+                if (wantBands > 0 && sr > 0)
+                {
+                    // Copy the newest FftSize samples out of the ring, oldest first. The mask
+                    // handles wrap; C# bitwise AND on a negative index is correct two's
+                    // complement, so no separate branch is needed near the origin.
+                    int w = _ringWrite;
+                    for (int i = 0; i < BandAnalyser.FftSize; i++)
+                        frame[i] = _ring[(w - BandAnalyser.FftSize + i) & (RingSize - 1)];
+
+                    analyser.Configure(sr, wantBands);
+                    analyser.Analyse(frame, SampleScale, bands);
+
+                    float gain = Sensitivity / 64f;
+                    float coef = 1f - (Smooth / 127f) * 0.98f;
+
+                    for (int b = 0; b < wantBands; b++)
+                    {
+                        float v = bands[b] * gain;
+                        if (v > 1f) v = 1f;
+                        bandsSmoothed[b] += coef * (v - bandsSmoothed[b]);
+                        msgs.Add((_addrBands[b], bandsSmoothed[b]));
+                    }
+                }
 
                 try
                 {
-                    byte[] pkt = OscEncoder.EncodeBundle(msgs);
+                    byte[] pkt = OscEncoder.EncodeBundle(msgs.ToArray());
                     udp.Send(pkt, pkt.Length);
                 }
                 catch { /* transient send errors must not kill the thread */ }
@@ -190,6 +262,8 @@ namespace WDE.PedalOsc
                 string safe = Sanitise(current);
                 _addrRms  = TapPrefix + safe + "/rms";
                 _addrPeak = TapPrefix + safe + "/peak";
+                for (int b = 0; b < BandAnalyser.MaxBands; b++)
+                    _addrBands[b] = TapPrefix + safe + "/band" + b;
             }
             catch { /* keep the previous addresses */ }
         }

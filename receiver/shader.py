@@ -189,6 +189,32 @@ void main() {
 """
 
 
+def _prepare_console():
+    """
+    On Windows, clicking in the console starts a QuickEdit selection that BLOCKS
+    stdout until dismissed. Since key handling prints from pyglet's event thread,
+    that freezes the render window - it looks like a lockup but is just a blocked
+    write. Turn QuickEdit off and enable ANSI handling.
+    """
+    if os.name != "nt":
+        return
+    os.system("")                     # enable ANSI escape processing
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        STD_INPUT_HANDLE = -10
+        ENABLE_QUICK_EDIT = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        mode = wintypes.DWORD()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            new = (mode.value & ~ENABLE_QUICK_EDIT) | ENABLE_EXTENDED_FLAGS
+            kernel32.SetConsoleMode(handle, new)
+    except Exception:
+        pass                          # not fatal - worst case QuickEdit stays on
+
+
 def short(address):
     """Trim an address to something readable in the console."""
     if address.startswith(PARAM):
@@ -209,7 +235,7 @@ def main():
     args = ap.parse_args()
 
     if os.name == "nt":
-        os.system("")
+        _prepare_console()
 
     disp = Dispatcher()
     disp.set_default_handler(on_msg)
@@ -317,6 +343,15 @@ def main():
 
     @window.event
     def on_key_press(symbol, modifiers):
+        # Any exception escaping here can leave the window unresponsive with no
+        # explanation, so report it and carry on rather than dying silently.
+        try:
+            _handle_key(symbol, modifiers)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    def _handle_key(symbol, modifiers):
         key = pyglet.window.key
         shift = modifiers & key.MOD_SHIFT
 
