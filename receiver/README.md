@@ -34,32 +34,42 @@ python oscdump.py
 python shader.py
 ```
 
-- **Audio level** drives background brightness and the centre disc's size.
-- **Beat phase** drives the flash, the beat ticks along the top, and the
-  per-bar expanding ring — locked to the sequencer grid, not inferred.
-- **A machine parameter** drives the colour and stretches the ring radius.
+Routes **any** value on the wire to **any** visual target. Sources are
+discovered from the stream, so nothing is named on the command line.
 
-Taps and parameters are **discovered from the stream**, so nothing needs naming
-on the command line — cycle through whatever is publishing:
+| Target | Effect |
+|---|---|
+| `BRIGHT` | background brightness |
+| `SIZE` | centre disc radius |
+| `HUE` | colour |
+| `RING` | expanding ring radius |
+| `WARP` | radial ripple distortion |
+| `FLASH` | disc brightness pulse |
+
+On startup it auto-routes something sensible — audio level to brightness and
+size, beat to flash, bar to ring, and the first two exported parameters to hue
+and warp — then prints the routing. Re-route anything from there:
 
 | Key | Action |
 |---|---|
-| `+` `-` | gain |
-| `A` | auto-gain |
-| `S` | visual smoothing (fast attack, slow release) |
-| `B` | beat visuals on/off — compare grid-lock against loudness-only |
-| `T` | next audio tap |
-| `P` | next machine parameter |
+| `1`–`6` | select a target (shows its source and gain) |
+| `[` `]` | cycle that target's source through everything discovered |
+| `+` `-` | that target's gain |
+| `0` | clear the target |
+| `S` | smoothing on/off (fast attack, slow release) |
+| `L` | list all discovered sources and what they drive |
 | `ESC` | quit |
 
-The selected tap and parameter are printed to the console as you cycle.
+Six bars down the left edge show each target's live value; the selected one is
+highlighted, unrouted ones are dimmed. Names go to the console rather than the
+window — no font machinery in the GL path.
 
-**Gain matters.** Raw RMS peaks well below 1.0 — a normally-loud mix reads
-~0.25 — so the default gain is 3.5. Tune with `+`/`-`, or press `A`.
+Gains default per source type: audio taps get ×3.5 (raw RMS peaks well below
+1.0 — a normally-loud mix reads ~0.25), everything else ×1.0 since it is
+already normalised.
 
-Try it with a filter sweep: export a synth's cutoff from Pedal OSC Data, press
-`P` until it is selected, and sweep the parameter in ReBuzz. The colour follows
-what you sequence.
+Try routing a filter cutoff to `WARP` and a resonance to `HUE`, then sequence
+both in the pattern editor.
 
 ## Notes
 

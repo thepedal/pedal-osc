@@ -1,20 +1,33 @@
 #!/usr/bin/env python3
 """OSC-driven shader for the ReBuzz -> video bridge (schema v2).
 
-Consumes the merged stream from both machines and drives shader uniforms:
+Routes any value arriving on the wire to any visual target. Sources are
+discovered from the stream at runtime - audio taps, transport, and every
+exported machine parameter - so nothing needs naming on the command line.
 
-  /rebuzz/song/beat, /bar    -> grid-locked flash, ring and beat ticks
-  /rebuzz/tap/<name>/rms     -> brightness (Pedal OSC, the audio tap)
-  /rebuzz/param/<m>/<p>      -> colour shift (Pedal OSC Data, any machine parameter)
+  /rebuzz/song/beat, /bar    transport and grid (Pedal OSC Data)
+  /rebuzz/tap/<name>/rms     per-instance audio level (Pedal OSC)
+  /rebuzz/param/<m>/<p>      any machine parameter (Pedal OSC Data)
 
-Taps and parameters are discovered from the stream at runtime; cycle through
-them with T and P rather than naming them on the command line.
+Six visual targets, each independently routable:
+
+  BRIGHT  background brightness
+  SIZE    centre disc radius
+  HUE     colour
+  RING    expanding ring radius
+  WARP    radial ripple distortion
+  FLASH   disc brightness pulse
 
 Run:   python shader.py
 Deps:  pip install -r requirements.txt   (moderngl, pyglet, python-osc)
 
-Keys:  +/- gain    A auto-gain    S smoothing    B beat visuals
-       T next tap  P next parameter            ESC quit
+Keys:  1-6      select a visual target
+       [ ]      cycle that target's source (Shift+[ ] steps backwards)
+       + -      that target's gain
+       0        clear that target
+       S        smoothing on/off
+       L        list all discovered sources
+       ESC      quit
 """
 
 import argparse
@@ -28,18 +41,20 @@ import pyglet
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import ThreadingOSCUDPServer
 
-# Newest value per address, plus discovery sets. Written by the OSC thread, read by
-# the render loop. Last-writer-wins: the renderer undersamples the senders (~60 fps
-# against ~125 msg/s each), so there is deliberately no queue.
-_vals = {}
-_taps = []          # discovered /rebuzz/tap/<name> prefixes, in first-seen order
-_params = []        # discovered /rebuzz/param/... addresses, in first-seen order
-_last_rx = 0.0
-_lock = threading.Lock()
-
 SONG = "/rebuzz/song/"
 TAP = "/rebuzz/tap/"
 PARAM = "/rebuzz/param/"
+
+# Newest value per address plus a stable discovery order. Written by the OSC
+# thread, read by the render loop. Last-writer-wins: the renderer undersamples
+# the senders (~60 fps against ~125 msg/s each), so there is no queue.
+_vals = {}
+_sources = []       # routable addresses, in first-seen order
+_last_rx = 0.0
+_lock = threading.Lock()
+
+# Addresses that are structural rather than routable signals.
+_SKIP = ("/rebuzz/v", SONG + "bpm", SONG + "playing", SONG + "beatsperbar")
 
 
 def on_msg(address, *args):
@@ -50,19 +65,30 @@ def on_msg(address, *args):
         v = float(args[0])
     except (TypeError, ValueError):
         return
-
     with _lock:
         _vals[address] = v
         _last_rx = time.time()
+        if address not in _SKIP and address not in _sources:
+            _sources.append(address)
 
-        if address.startswith(TAP):
-            # /rebuzz/tap/<name>/rms  ->  remember the <name> prefix once
-            prefix = address.rsplit("/", 1)[0]
-            if prefix not in _taps:
-                _taps.append(prefix)
-        elif address.startswith(PARAM):
-            if address not in _params:
-                _params.append(address)
+
+# Visual targets, in HUD order.
+SLOTS = ["BRIGHT", "SIZE", "HUE", "RING", "WARP", "FLASH"]
+
+# Sensible opening routing, applied as sources appear. Each entry is a
+# predicate over the address; the first unrouted match wins.
+DEFAULTS = {
+    "BRIGHT": lambda a: a.startswith(TAP) and a.endswith("/rms"),
+    "SIZE":   lambda a: a.startswith(TAP) and a.endswith("/rms"),
+    "FLASH":  lambda a: a == SONG + "beat",
+    "RING":   lambda a: a == SONG + "bar",
+    "HUE":    lambda a: a.startswith(PARAM),
+    "WARP":   lambda a: a.startswith(PARAM),
+}
+
+# Tap levels are small (a loud mix reads ~0.25); everything else is already 0..1.
+def default_gain(address):
+    return 3.5 if address.startswith(TAP) else 1.0
 
 
 VERT = """
@@ -80,88 +106,118 @@ FRAG = """
 in vec2 uv;
 out vec4 fragColor;
 
-uniform float uLevel;        // audio level 0..1, post-gain
-uniform float uBeat;         // beat phase 0..1  <- grid-locked
-uniform float uBar;          // bar phase 0..1
-uniform float uBeatsPerBar;
-uniform float uParam;        // any exported machine parameter, 0..1
-uniform float uHasParam;     // 1.0 when a parameter is mapped
-uniform float uAspect;
-uniform float uStale;
-uniform float uUseBeat;
+uniform float uBright;
+uniform float uSize;
+uniform float uHue;
+uniform float uRing;
+uniform float uWarp;
+uniform float uFlash;
 
-// Cheap hue rotation so the mapped parameter is unmistakable on screen.
+uniform float uBar;          // grid reference for the beat ticks
+uniform float uBeatsPerBar;
+uniform float uAspect;
+uniform float uTime;
+uniform float uStale;
+uniform int   uSelected;     // highlighted HUD row
+uniform int   uActive;       // bitmask of routed slots
+
 vec3 tint(float h) {
     return 0.5 + 0.5 * cos(6.28318 * (h + vec3(0.00, 0.33, 0.67)));
 }
 
 void main() {
-    vec3 base = (uHasParam > 0.5) ? tint(uParam * 0.85) : vec3(1.00, 0.93, 0.84);
+    vec3 base = tint(uHue * 0.85 + 0.08);
 
-    // Background: loudness.
-    vec3 col = vec3(uLevel * 0.55) * base;
+    vec2 p = (uv - 0.5) * vec2(uAspect, 1.0);
+    float r = length(p);
 
-    if (uUseBeat > 0.5) {
-        // Sharp attack at phase 0, decaying across the beat.
-        float flash = pow(1.0 - uBeat, 5.0);
+    // WARP: radial ripple. Displaces the radius every later feature reads,
+    // so one source can visibly deform the whole composition.
+    float rw = r + sin(r * 26.0 - uTime * 2.2) * uWarp * 0.05;
 
-        vec2 p = (uv - 0.5) * vec2(uAspect, 1.0);
-        float r = length(p);
+    // Background.
+    vec3 col = vec3(uBright * 0.55) * base;
 
-        // Centre disc: size follows level, brightness follows the beat.
-        float radius = 0.10 + 0.16 * uLevel;
-        float disc = smoothstep(radius, radius - 0.012, r);
-        col += disc * flash * base;
+    // Centre disc: SIZE sets the radius, FLASH the brightness.
+    float radius = 0.06 + 0.22 * uSize;
+    float disc = smoothstep(radius, radius - 0.012, rw);
+    col += disc * (0.15 + 0.85 * uFlash) * base;
 
-        // One expanding ring per bar. Its radius also stretches with the parameter,
-        // so a slow filter sweep visibly reshapes the geometry.
-        float ringR = 0.18 + uBar * (0.26 + 0.18 * uParam * uHasParam);
-        float ring = smoothstep(0.012, 0.0, abs(r - ringR)) * (1.0 - uBar) * 0.6;
-        col += ring * vec3(0.35, 0.65, 1.00);
+    // Expanding ring.
+    float ringR = 0.18 + uRing * 0.34;
+    float ring = smoothstep(0.013, 0.0, abs(rw - ringR)) * (1.0 - uRing) * 0.65;
+    col += ring * vec3(0.35, 0.65, 1.00);
 
-        // Beat ticks across the top; the current beat of the bar lights up.
-        if (uv.y > 0.955) {
-            float n = max(1.0, uBeatsPerBar);
-            float slot = floor(uv.x * n);
-            float cur = floor(uBar * n);
-            if (abs(fract(uv.x * n) - 0.5) < 0.30) {
-                col = (slot == cur) ? base * (0.35 + 0.65 * flash) : vec3(0.10);
+    // Beat ticks across the top, straight off the bar phase.
+    if (uv.y > 0.955) {
+        float n = max(1.0, uBeatsPerBar);
+        float slot = floor(uv.x * n);
+        float cur = floor(uBar * n);
+        if (abs(fract(uv.x * n) - 0.5) < 0.30) {
+            col = (slot == cur) ? base * (0.35 + 0.65 * uFlash) : vec3(0.10);
+        }
+    }
+
+    // ---- HUD: six value bars down the left edge -------------------------
+    // No text (that would need font machinery); the console names the routing.
+    float slots[6] = float[6](uBright, uSize, uHue, uRing, uWarp, uFlash);
+    if (uv.x < 0.135 && uv.y > 0.70 && uv.y < 0.94) {
+        float row = (0.94 - uv.y) / 0.04;        // 0..6 top to bottom
+        int idx = int(floor(row));
+        if (idx >= 0 && idx < 6) {
+            float withinRow = fract(row);
+            if (withinRow > 0.25 && withinRow < 0.85) {
+                float x = (uv.x - 0.012) / 0.115;
+                bool routed = (uActive & (1 << idx)) != 0;
+                vec3 rowCol = (idx == uSelected) ? vec3(1.00, 0.85, 0.45)
+                                                 : vec3(0.55, 0.60, 0.70);
+                if (!routed) rowCol *= 0.30;
+                if (x > 0.0 && x < 1.0) {
+                    col = (x < slots[idx]) ? rowCol : vec3(0.10);
+                    // Tick the selected row so it is findable at a glance.
+                    if (idx == uSelected && x < 0.012) col = vec3(1.0, 0.85, 0.45);
+                }
             }
         }
     }
 
-    // Diagnostic strips: level along the bottom, mapped parameter just above it.
-    if (uv.y < 0.022) {
-        col = (uv.x < uLevel) ? vec3(0.95, 0.55, 0.20) : vec3(0.07);
-        if (uStale > 0.5) col = vec3(0.35, 0.06, 0.06);
-    } else if (uHasParam > 0.5 && uv.y < 0.040) {
-        col = (uv.x < uParam) ? base * 0.9 : vec3(0.05);
-    }
+    // Stale marker along the very bottom.
+    if (uv.y < 0.012 && uStale > 0.5) col = vec3(0.35, 0.06, 0.06);
 
     fragColor = vec4(col, 1.0);
 }
 """
 
 
+def short(address):
+    """Trim an address to something readable in the console."""
+    if address.startswith(PARAM):
+        return address[len(PARAM):]
+    if address.startswith(TAP):
+        return "tap " + address[len(TAP):]
+    if address.startswith(SONG):
+        return "song " + address[len(SONG):]
+    return address
+
+
 def main():
     ap = argparse.ArgumentParser(description="OSC-driven shader for the ReBuzz video bridge.")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=9000)
-    ap.add_argument("--gain", type=float, default=3.5,
-                    help="initial gain (default 3.5; raw RMS peaks well below 1.0)")
-    ap.add_argument("--width", type=int, default=900)
-    ap.add_argument("--height", type=int, default=600)
+    ap.add_argument("--width", type=int, default=980)
+    ap.add_argument("--height", type=int, default=640)
     args = ap.parse_args()
 
     if os.name == "nt":
-        os.system("")   # enable ANSI handling for console messages
+        os.system("")
 
     disp = Dispatcher()
     disp.set_default_handler(on_msg)
     server = ThreadingOSCUDPServer((args.host, args.port), disp)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"Listening on {args.host}:{args.port}")
-    print("Keys:  +/- gain   A auto-gain   S smoothing   B beat   T tap   P param   ESC quit")
+    print("Keys:  1-6 select target   [ ] cycle source   +/- gain   0 clear")
+    print("       S smoothing   L list sources   ESC quit\n")
 
     config = pyglet.gl.Config(major_version=3, minor_version=3,
                               forward_compatible=True, double_buffer=True)
@@ -173,55 +229,87 @@ def main():
     quad = ctx.buffer(struct.pack("8f", -1, -1, 1, -1, -1, 1, 1, 1))
     vao = ctx.vertex_array(prog, [(quad, "2f", "in_pos")])
 
-    st = {"gain": args.gain, "auto": False, "smooth": True, "beat": True,
-          "shown": 0.0, "peak": 0.05, "tap": 0, "param": 0}
+    # Routing state: one entry per visual target.
+    route = {s: {"src": None, "gain": 1.0, "shown": 0.0} for s in SLOTS}
+    st = {"sel": 0, "smooth": True, "t0": time.time(), "seen": 0}
+
+    def autoroute(sources):
+        """Fill unrouted targets as sources appear, without disturbing manual choices."""
+        for slot in SLOTS:
+            if route[slot]["src"] is not None:
+                continue
+            pred = DEFAULTS.get(slot)
+            if pred is None:
+                continue
+            taken = {route[s]["src"] for s in SLOTS if route[s]["src"]}
+            for a in sources:
+                # Allow BRIGHT and SIZE to share one tap; otherwise prefer unused.
+                if pred(a) and (a not in taken or slot in ("SIZE",)):
+                    route[slot]["src"] = a
+                    route[slot]["gain"] = default_gain(a)
+                    print(f"  {slot:6s} <- {short(a)}")
+                    break
 
     def render():
         now = time.time()
         with _lock:
             vals = dict(_vals)
-            taps = list(_taps)
-            params = list(_params)
+            sources = list(_sources)
             last_rx = _last_rx
+
+        if len(sources) != st["seen"]:
+            if st["seen"] == 0:
+                print("routing:")
+            st["seen"] = len(sources)
+            autoroute(sources)
 
         stale = (last_rx == 0.0) or (now - last_rx > 1.0)
 
-        # Level from the selected tap, if any tap is publishing.
-        raw = 0.0
-        if taps:
-            raw = vals.get(taps[st["tap"] % len(taps)] + "/rms", 0.0)
-
-        if st["auto"]:
-            st["peak"] = max(raw, st["peak"] * 0.9995, 0.02)
-            level = raw * (0.92 / st["peak"])
-        else:
-            level = raw * st["gain"]
-        level = 0.0 if stale else max(0.0, min(1.0, level))
-
-        # Fast attack, slower release: transients stay sharp, the image does not flicker.
-        if st["smooth"]:
-            k = 0.55 if level > st["shown"] else 0.12
-            st["shown"] += k * (level - st["shown"])
-        else:
-            st["shown"] = level
-
-        pval, has_param = 0.0, 0.0
-        if params:
-            pval = vals.get(params[st["param"] % len(params)], 0.0)
-            has_param = 1.0
+        active = 0
+        for i, slot in enumerate(SLOTS):
+            r = route[slot]
+            if r["src"] is None:
+                target = 0.0
+            else:
+                active |= (1 << i)
+                target = vals.get(r["src"], 0.0) * r["gain"]
+                target = max(0.0, min(1.0, 0.0 if stale else target))
+            if st["smooth"]:
+                k = 0.55 if target > r["shown"] else 0.14
+                r["shown"] += k * (target - r["shown"])
+            else:
+                r["shown"] = target
 
         ctx.viewport = (0, 0, window.width, window.height)
         ctx.clear(0.0, 0.0, 0.0)
-        prog["uLevel"].value = st["shown"]
-        prog["uBeat"].value = vals.get(SONG + "beat", 0.0)
+        prog["uBright"].value = route["BRIGHT"]["shown"]
+        prog["uSize"].value = route["SIZE"]["shown"]
+        prog["uHue"].value = route["HUE"]["shown"]
+        prog["uRing"].value = route["RING"]["shown"]
+        prog["uWarp"].value = route["WARP"]["shown"]
+        prog["uFlash"].value = route["FLASH"]["shown"]
         prog["uBar"].value = vals.get(SONG + "bar", 0.0)
         prog["uBeatsPerBar"].value = max(1.0, vals.get(SONG + "beatsperbar", 4.0))
-        prog["uParam"].value = pval
-        prog["uHasParam"].value = has_param
         prog["uAspect"].value = window.width / max(1, window.height)
+        prog["uTime"].value = now - st["t0"]
         prog["uStale"].value = 1.0 if stale else 0.0
-        prog["uUseBeat"].value = 1.0 if (st["beat"] and not stale) else 0.0
+        prog["uSelected"].value = st["sel"]
+        prog["uActive"].value = active
         vao.render(moderngl.TRIANGLE_STRIP)
+
+    def cycle(step):
+        with _lock:
+            sources = list(_sources)
+        if not sources:
+            print("no sources discovered yet - are the machines in the song?")
+            return
+        slot = SLOTS[st["sel"]]
+        cur = route[slot]["src"]
+        i = sources.index(cur) if cur in sources else -1
+        nxt = sources[(i + step) % len(sources)]
+        route[slot]["src"] = nxt
+        route[slot]["gain"] = default_gain(nxt)
+        print(f"{slot:6s} <- {short(nxt)}")
 
     @window.event
     def on_draw():
@@ -230,39 +318,44 @@ def main():
     @window.event
     def on_key_press(symbol, modifiers):
         key = pyglet.window.key
+        shift = modifiers & key.MOD_SHIFT
+
         if symbol == key.ESCAPE:
             pyglet.app.exit()
+        elif key._1 <= symbol <= key._6:
+            st["sel"] = symbol - key._1
+            slot = SLOTS[st["sel"]]
+            src = route[slot]["src"]
+            print(f"[{slot}] {short(src) if src else '(unrouted)'}"
+                  f"   gain {route[slot]['gain']:.2f}")
+        elif symbol == key.BRACKETRIGHT:
+            cycle(1)
+        elif symbol == key.BRACKETLEFT:
+            cycle(-1)
         elif symbol in (key.PLUS, key.EQUAL, key.NUM_ADD):
-            st["gain"] = min(64.0, st["gain"] * 1.25)
-            print(f"gain {st['gain']:.2f}")
+            slot = SLOTS[st["sel"]]
+            route[slot]["gain"] = min(64.0, route[slot]["gain"] * 1.25)
+            print(f"{slot:6s} gain {route[slot]['gain']:.2f}")
         elif symbol in (key.MINUS, key.NUM_SUBTRACT):
-            st["gain"] = max(0.25, st["gain"] / 1.25)
-            print(f"gain {st['gain']:.2f}")
-        elif symbol == key.A:
-            st["auto"] = not st["auto"]
-            print(f"auto-gain {'on' if st['auto'] else 'off'}")
+            slot = SLOTS[st["sel"]]
+            route[slot]["gain"] = max(0.05, route[slot]["gain"] / 1.25)
+            print(f"{slot:6s} gain {route[slot]['gain']:.2f}")
+        elif symbol == key._0:
+            slot = SLOTS[st["sel"]]
+            route[slot]["src"] = None
+            print(f"{slot:6s} cleared")
         elif symbol == key.S:
             st["smooth"] = not st["smooth"]
             print(f"smoothing {'on' if st['smooth'] else 'off'}")
-        elif symbol == key.B:
-            st["beat"] = not st["beat"]
-            print(f"beat visuals {'on' if st['beat'] else 'off'}")
-        elif symbol == key.T:
+        elif symbol == key.L:
             with _lock:
-                taps = list(_taps)
-            if taps:
-                st["tap"] = (st["tap"] + 1) % len(taps)
-                print(f"tap -> {taps[st['tap']]}")
-            else:
-                print("no taps seen yet (is Pedal OSC in the song?)")
-        elif symbol == key.P:
-            with _lock:
-                params = list(_params)
-            if params:
-                st["param"] = (st["param"] + 1) % len(params)
-                print(f"param -> {params[st['param']]}")
-            else:
-                print("no parameters seen yet (set Machine and Params on Pedal OSC Data)")
+                sources = list(_sources)
+            print(f"\n{len(sources)} sources:")
+            for a in sources:
+                used = [s for s in SLOTS if route[s]["src"] == a]
+                mark = ("  -> " + ", ".join(used)) if used else ""
+                print(f"  {short(a)}{mark}")
+            print()
 
     def tick(dt):
         window.invalid = True
