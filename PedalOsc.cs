@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using Buzz.MachineInterface;   // IBuzzMachine, IBuzzMachineHost, MachineDecl, ParameterDecl,
@@ -27,8 +26,6 @@ namespace WDE.PedalOsc
         const string AddrVersion   = "/rebuzz/v";
         const string TapPrefix     = "/rebuzz/tap/";
         const float  SchemaVersion = 2f;
-        const string DestHost      = "127.0.0.1";
-        const int    DestPort      = 9000;
         const int    SendHz        = 125;
 
         // ReBuzz samples are +/-32768 float. Confirmed in the engine source: the master output
@@ -48,6 +45,29 @@ namespace WDE.PedalOsc
         [ParameterDecl(Name = "Bands", Description = "Log-spaced FFT bands to publish (0 = off).",
                        MinValue = 0, MaxValue = BandAnalyser.MaxBands, DefValue = BandAnalyser.MaxBands)]
         public int Bands { get; set; } = BandAnalyser.MaxBands;
+
+        // ---- destination (parameter-driven; persists with the song) ----
+        // IP as four octets; all-zero = loopback. Port as an offset from 9000. See OscConfig.cs.
+
+        [ParameterDecl(Name = "Dst IP 1", Description = "Destination IP octet 1 (0 = loopback).",
+                       MinValue = 0, MaxValue = 254, DefValue = 0)]
+        public int DstIp1 { get; set; } = 0;
+
+        [ParameterDecl(Name = "Dst IP 2", Description = "Destination IP octet 2.",
+                       MinValue = 0, MaxValue = 254, DefValue = 0)]
+        public int DstIp2 { get; set; } = 0;
+
+        [ParameterDecl(Name = "Dst IP 3", Description = "Destination IP octet 3.",
+                       MinValue = 0, MaxValue = 254, DefValue = 0)]
+        public int DstIp3 { get; set; } = 0;
+
+        [ParameterDecl(Name = "Dst IP 4", Description = "Destination IP octet 4.",
+                       MinValue = 0, MaxValue = 254, DefValue = 0)]
+        public int DstIp4 { get; set; } = 0;
+
+        [ParameterDecl(Name = "Port +", Description = "Destination port offset from 9000.",
+                       MinValue = 0, MaxValue = 127, DefValue = 0)]
+        public int PortOffset { get; set; } = 0;
 
         // ------------------------------------------------------------------
         // Level frame. Published by the audio thread, consumed by the sender.
@@ -94,7 +114,7 @@ namespace WDE.PedalOsc
 
         Thread? _sender;
         volatile bool _running;
-        UdpClient? _udp;
+        readonly OscSender _osc = new OscSender();
 
         public PedalOscMachine(IBuzzMachineHost host)
         {
@@ -102,9 +122,6 @@ namespace WDE.PedalOsc
 
             for (int b = 0; b < BandAnalyser.MaxBands; b++)
                 _addrBands[b] = TapPrefix + "unnamed/band" + b;
-
-            _udp = new UdpClient();
-            _udp.Connect(DestHost, DestPort);     // resolve the endpoint once, reuse per send
 
             _running = true;
             _sender = new Thread(SenderLoop) { IsBackground = true, Name = "PedalOscSender" };
@@ -195,8 +212,9 @@ namespace WDE.PedalOsc
 
             while (_running)
             {
-                UdpClient? udp = _udp;            // snapshot (may be nulled by Dispose)
-                if (udp == null) break;
+                // Re-point the socket from the destination parameters. Cheap unless it changed.
+                _osc.Retarget(OscEndpoint.Host(DstIp1, DstIp2, DstIp3, DstIp4),
+                              OscEndpoint.Port(PortOffset));
 
                 RefreshAddresses();
 
@@ -233,12 +251,8 @@ namespace WDE.PedalOsc
                     }
                 }
 
-                try
-                {
-                    byte[] pkt = OscEncoder.EncodeBundle(msgs.ToArray());
-                    udp.Send(pkt, pkt.Length);
-                }
-                catch { /* transient send errors must not kill the thread */ }
+                byte[] pkt = OscEncoder.EncodeBundle(msgs.ToArray());
+                _osc.Send(pkt, pkt.Length);
 
                 Thread.Sleep(periodMs);
             }
@@ -294,8 +308,7 @@ namespace WDE.PedalOsc
         {
             _running = false;
             try { _sender?.Join(200); } catch { }
-            try { _udp?.Close(); }      catch { }
-            _udp = null;
+            _osc.Dispose();
         }
     }
 }

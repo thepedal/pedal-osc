@@ -55,6 +55,16 @@ endpoint.
 - **Smooth** (0–127, default 0 = raw) — one-pole smoothing on sent values.
 - **Bands** (0–8, default 8) — how many FFT bands to publish. `0` disables the
   transform entirely.
+- **Dst IP 1–4** (0–254, default 0) — destination IP as four octets. All zero =
+  loopback (`127.0.0.1`), the zero-config default. Set them to reach another
+  machine on the LAN, e.g. `192 168 1 50`.
+- **Port +** (0–127, default 0) — destination port as an offset from 9000, so
+  `13` sends to `9013`. Lets several receivers run on one box.
+
+The destination is parameter-driven so it **saves and restores with the song**,
+and is editable live — moving an octet re-points the socket within one send.
+(Octets cap at 254 because 255 is the Byte parameter's "no value" sentinel; a
+full arbitrary host/port would need a GUI, deferred.)
 
 ## Build & deploy
 

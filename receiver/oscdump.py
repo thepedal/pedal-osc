@@ -99,7 +99,8 @@ def display_loop():
 
 def main():
     ap = argparse.ArgumentParser(description="Generic OSC dump for the ReBuzz video bridge.")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="bind address; 0.0.0.0 receives on all interfaces (needed for LAN)")
     ap.add_argument("--port", type=int, default=9000)
     args = ap.parse_args()
 

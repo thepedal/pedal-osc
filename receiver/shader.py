@@ -228,7 +228,8 @@ def short(address):
 
 def main():
     ap = argparse.ArgumentParser(description="OSC-driven shader for the ReBuzz video bridge.")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="bind address; 0.0.0.0 receives on all interfaces (needed for LAN)")
     ap.add_argument("--port", type=int, default=9000)
     ap.add_argument("--width", type=int, default=980)
     ap.add_argument("--height", type=int, default=640)
